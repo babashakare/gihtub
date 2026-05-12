@@ -82,38 +82,61 @@ jobs:
           git rm --cached -r site_download 2>/dev/null || true
           echo "Old archives cleaned."
 
-      - name: Parse inputs
-        id: parse
+      - name: Setup Environment
+        id: setup
         run: |
           SIZE=$(echo "${{ github.event.inputs.split_size }}" | grep -oP '\d+')
           echo "split_mb=${SIZE:-95}" >> $GITHUB_OUTPUT
           
-          # Prepare URLs list if site_url is not provided
-          if [ -z "${{ github.event.inputs.site_url }}" ]; then
-            cat > urls.txt << URLEOF
-            ${{ github.event.inputs.file_url_1 }}
-            ${{ github.event.inputs.file_url_2 }}
-            ${{ github.event.inputs.file_url_3 }}
-            ${{ github.event.inputs.file_url_4 }}
-            ${{ github.event.inputs.file_url_5 }}
-            URLEOF
+          # Check if site_url is provided
+          if [ -n "${{ github.event.inputs.site_url }}" ]; then
+            echo "mode=website" >> $GITHUB_OUTPUT
+            echo "site_url=${{ github.event.inputs.site_url }}" >> $GITHUB_OUTPUT
+            echo "Mode: Website Download"
+          else
+            echo "mode=files" >> $GITHUB_OUTPUT
+            # Prepare URLs list
+            echo "${{ github.event.inputs.file_url_1 }}" > urls.txt
+            if [ -n "${{ github.event.inputs.file_url_2 }}" ]; then echo "${{ github.event.inputs.file_url_2 }}" >> urls.txt; fi
+            if [ -n "${{ github.event.inputs.file_url_3 }}" ]; then echo "${{ github.event.inputs.file_url_3 }}" >> urls.txt; fi
+            if [ -n "${{ github.event.inputs.file_url_4 }}" ]; then echo "${{ github.event.inputs.file_url_4 }}" >> urls.txt; fi
+            if [ -n "${{ github.event.inputs.file_url_5 }}" ]; then echo "${{ github.event.inputs.file_url_5 }}" >> urls.txt; fi
+            
+            # Remove empty lines
             sed -i '/^$/d' urls.txt
             sed -i 's/^[ \t]*//;s/[ \t]*$//' urls.txt
+            
             total=$(wc -l < urls.txt)
             echo "url_count=${total}" >> $GITHUB_OUTPUT
+            echo "Mode: File Downloads"
             echo "URL count: ${total}"
-            cat -n urls.txt
-          else
-            echo "site_url=${{ github.event.inputs.site_url }}" >> $GITHUB_OUTPUT
-            echo "Downloading website: ${{ github.event.inputs.site_url }}"
+            cat urls.txt
           fi
 
-      - name: Download all files (if no site_url)
-        if: ${{ github.event.inputs.site_url == '' }}
+      - name: Download Website
+        if: ${{ steps.setup.outputs.mode == 'website' }}
+        id: download_website
+        run: |
+          SITE_URL="${{ steps.setup.outputs.site_url }}"
+          mkdir -p site_download
+          echo "Starting download of: $SITE_URL"
+          echo "This may take a while depending on the site size..."
+          
+          wget -r -k -p -e robots=off --no-check-certificate --timeout=30 \
+            --directory-prefix=site_download \
+            --convert-links \
+            --adjust-extension \
+            --page-requisites \
+            "$SITE_URL" || echo "Download finished with some errors, but proceeding..."
+          
+          echo "Website download completed."
+
+      - name: Download all files
+        if: ${{ steps.setup.outputs.mode == 'files' }}
         id: download_files
         run: |
           mkdir -p files
-          total=${{ steps.parse.outputs.url_count }}
+          total=${{ steps.setup.outputs.url_count }}
           counter=1
           success=0
           while IFS= read -r url; do
@@ -162,39 +185,10 @@ jobs:
           echo "success_count=${success}" >> $GITHUB_OUTPUT
           echo "Downloaded: $success / $total"
 
-      - name: Download Website
-        if: ${{ github.event.inputs.site_url != '' }}
-        id: download_website
-        run: |
-          SITE_URL="${{ github.event.inputs.site_url }}"
-          mkdir -p site_download
-          echo "Starting download of: $SITE_URL"
-          echo "This may take a while depending on the site size..."
-          
-          # wget options:
-          # -r: recursive
-          # -k: convert links for local viewing
-          # -p: download all files needed for display (images, css, etc.)
-          # -e robots=off: ignore robots.txt
-          # --no-check-certificate: skip SSL errors if any
-          # --timeout=30: connection timeout
-          wget -r -k -p -e robots=off --no-check-certificate --timeout=30 \
-            --directory-prefix=site_download \
-            --convert-links \
-            --adjust-extension \
-            --page-requisites \
-            "$SITE_URL" || echo "Download finished with some errors, but proceeding..."
-          
-          # Clean up the main index.html if it was downloaded into a subfolder
-          if [ -d "site_download" ]; then
-             # Move contents up one level if needed, but wget usually creates index.html in the dir
-             echo "Website download completed."
-          fi
-
       - name: Process and archive
         id: process_files
         run: |
-          SPLIT_MB=${{ steps.parse.outputs.split_mb }}
+          SPLIT_MB=${{ steps.setup.outputs.split_mb }}
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
           FOLDER="downloads/${TIMESTAMP}"
           mkdir -p "$FOLDER"
@@ -302,14 +296,14 @@ jobs:
           echo ""
           echo "========================================="
           echo "Job completed!"
-          if [ -n "${{ steps.parse.outputs.site_url }}" ]; then
+          if [ "${{ steps.setup.outputs.mode }}" == "website" ]; then
             echo "Type: Website Download"
-            echo "URL: ${{ steps.parse.outputs.site_url }}"
+            echo "URL: ${{ steps.setup.outputs.site_url }}"
           else
-            echo "Downloaded: ${{ steps.download_files.outputs.success_count }} / ${{ steps.parse.outputs.url_count }}"
+            echo "Downloaded: ${{ steps.download_files.outputs.success_count }} / ${{ steps.setup.outputs.url_count }}"
           fi
           echo "Processed: ${{ steps.process_files.outputs.processed_count }} archive(s)"
-          echo "Split size: ${{ steps.parse.outputs.split_mb }}MB"
+          echo "Split size: ${{ steps.setup.outputs.split_mb }}MB"
           echo "Folder: $FOLDER"
           echo "Total size: ${TOTAL_SIZE}"
           echo "========================================="
@@ -318,10 +312,10 @@ jobs:
           ## 📊 خلاصه اجرا
           | مورد | مقدار |
           |------|-------|
-          | نوع دانلود | $([ -n "${{ steps.parse.outputs.site_url }}" ] && echo 'سایت وب' || echo 'فایل‌های جداگانه') |
-          | لینک/آدرس | $([ -n "${{ steps.parse.outputs.site_url }}" ] && echo '${{ steps.parse.outputs.site_url }}' || echo '${{ steps.parse.outputs.url_count }} فایل') |
+          | نوع دانلود | ${{ steps.setup.outputs.mode == 'website' && 'سایت وب' || 'فایل‌های جداگانه' }} |
+          | لینک/آدرس | ${{ steps.setup.outputs.mode == 'website' && steps.setup.outputs.site_url || steps.setup.outputs.url_count + ' فایل' }} |
           | فایل پردازش شده | ${{ steps.process_files.outputs.processed_count }} عدد آرشیو |
-          | حداکثر حجم هر تکه | ${{ steps.parse.outputs.split_mb }} مگابایت |
+          | حداکثر حجم هر تکه | ${{ steps.setup.outputs.split_mb }} مگابایت |
           | حجم کل | ${TOTAL_SIZE} |
           | 📂 پوشه دانلود | [ ${FOLDER}](https://github.com/${{ github.repository }}/tree/main/${FOLDER}) |
           | وضعیت | ✅ موفق |
