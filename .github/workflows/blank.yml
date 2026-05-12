@@ -44,7 +44,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y p7zip-full wget
+          sudo apt-get install -y p7zip-full wget dnsutils
 
       - name: Clean old archives
         if: ${{ github.event.inputs.delete_old_archives == 'true' }}
@@ -62,17 +62,14 @@ jobs:
           echo "split_mb=${SIZE:-95}" >> $GITHUB_OUTPUT
           
           URL="${{ github.event.inputs.target_url }}"
-          # Remove trailing slash if exists for consistency
+          # Remove trailing slash
           URL="${URL%/}"
           
-          # Determine if it's likely a website or a direct file
-          # If it ends with common file extensions, treat as file. Otherwise, treat as site.
+          # Determine type
           if [[ "$URL" =~ \.(jpg|jpeg|png|gif|pdf|zip|rar|exe|mp4|mp3|iso|dmg|tar|gz|bz2)$ ]]; then
             echo "type=file" >> $GITHUB_OUTPUT
-            echo "Is likely a direct file download."
           else
             echo "type=website" >> $GITHUB_OUTPUT
-            echo "Is likely a website URL."
           fi
           echo "URL: $URL"
           echo "Type: ${{ steps.vars.outputs.type }}"
@@ -87,16 +84,13 @@ jobs:
           
           if [ "${{ steps.vars.outputs.type }}" == "file" ]; then
             echo "Downloading file..."
-            # Get filename from URL
             FILENAME=$(basename "$URL")
-            if [ -z "$FILENAME" ]; then
-              FILENAME="downloaded_file"
-            fi
-            # Remove query params if any for naming
             FILENAME=$(echo "$FILENAME" | cut -d'?' -f1)
+            if [ -z "$FILENAME" ]; then FILENAME="downloaded_file"; fi
             
-            echo "Downloading $FILENAME"
-            if curl -L --fail --retry 5 --retry-delay 10 --connect-timeout 30 -o "source/$FILENAME" "$URL"; then
+            # Use Google DNS for better resolution in restricted environments
+            echo "Downloading $FILENAME using Google DNS..."
+            if curl --resolve "$(echo $URL | cut -d'/' -f3):443:8.8.8.8" -L --fail --retry 5 --retry-delay 10 --connect-timeout 30 -o "source/$FILENAME" "$URL"; then
               echo "status=success" >> $GITHUB_OUTPUT
               echo "filename=$FILENAME" >> $GITHUB_OUTPUT
             else
@@ -106,22 +100,13 @@ jobs:
             fi
           else
             echo "Downloading website..."
-            # Use wget to mirror the website
-            # -r: recursive
-            # -k: convert links for local viewing
-            # -p: download all files needed for display
-            # -e robots=off: ignore robots.txt
-            # --no-check-certificate: skip SSL errors
-            # --timeout: connection timeout
-            # --directory-prefix: where to save files
-            # --convert-links: convert links in downloaded HTML to relative
-            # --adjust-extension: add .html if needed
-            # --page-requisites: download CSS, etc.
-            # -H: span across hosts
-            # --no-host-directories: don't create host directories
-            # -D: domains to accept (optional, but good for limiting)
+            SITE_DOMAIN=$(echo "$URL" | sed 's|https\?://||' | sed 's|/.*||')
             
-            SITE_NAME=$(echo "$URL" | sed 's|https\?://||' | sed 's|/.*||' | sed 's/\./_/g')
+            # Use wget with Google DNS
+            echo "Downloading site: $SITE_DOMAIN using Google DNS..."
+            
+            # Clean source dir before download
+            rm -rf source/*
             
             wget -r -k -p -e robots=off --no-check-certificate --timeout=30 \
               --directory-prefix=source \
@@ -129,28 +114,23 @@ jobs:
               --adjust-extension \
               --page-requisites \
               --no-host-directories \
-              "$URL" || echo "Download finished with some warnings/errors, but proceeding..."
+              --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" \
+              "$URL" 2>&1 | tee wget_log.txt || echo "Download finished with some warnings/errors."
             
-            # Clean up the top-level index.html if it was downloaded into a subfolder, 
-            # but usually wget creates a folder with the domain name or puts index.html in the prefix dir.
-            # Let's find the main folder created.
-            # Usually it creates a folder named like the domain in the directory-prefix.
-            # If it created 'source/example.com', we want to archive that.
-            # If it created 'source/index.html', we want to archive the current dir content.
-            
-            # Check if a folder was created
-            FOLDERS=$(find source -maxdepth 1 -type d -not -name "source")
-            if [ -n "$FOLDERS" ]; then
-              # If there's a folder, use it
-              echo "Found folder: $FOLDERS"
-              # Move contents up if needed or just archive the folder
-              # Let's archive the specific folder created by wget
-              echo "source_folder=$(echo $FOLDERS | head -n 1)" >> $GITHUB_OUTPUT
+            # Check if wget succeeded
+            if [ -f "source/index.html" ] || [ "$(ls -A source)" ]; then
               echo "status=success" >> $GITHUB_OUTPUT
+              # Determine the folder to archive
+              # If wget created a folder with the domain name inside source/
+              if [ -d "source/$SITE_DOMAIN" ]; then
+                echo "source_folder=$SITE_DOMAIN" >> $GITHUB_OUTPUT
+              else
+                echo "source_folder=." >> $GITHUB_OUTPUT
+              fi
             else
-              # If no folder, wget put files in source/
-              echo "source_folder=source" >> $GITHUB_OUTPUT
-              echo "status=success" >> $GITHUB_OUTPUT
+              echo "status=failed" >> $GITHUB_OUTPUT
+              echo "Website download failed."
+              exit 1
             fi
           fi
 
@@ -164,23 +144,20 @@ jobs:
           mkdir -p "$OUTPUT_FOLDER"
           
           SOURCE_DIR="${{ steps.download.outputs.source_folder }}"
+          SOURCE_PATH="source/$SOURCE_DIR"
           
           if [ "${{ steps.vars.outputs.type }}" == "file" ]; then
             FILENAME="${{ steps.download.outputs.filename }}"
-            ARCHIVE_NAME="${FILENAME%.????}"}" # Remove extension for archive name
-            ARCHIVE_NAME="${ARCHIVE_NAME%.???}"
-            ARCHIVE_NAME="${ARCHIVE_NAME%.??}"
-            ARCHIVE_NAME="${ARCHIVE_NAME%.?}"
-            ARCHIVE_NAME="${ARCHIVE_NAME:-archived_file}"
-            
-            echo "Archiving file: $FILENAME"
+            # Create a clean name for archive
+            ARCHIVE_NAME="${FILENAME%.*}"
+            if [ "$ARCHIVE_NAME" = "$FILENAME" ]; then
+              ARCHIVE_NAME="file"
+            fi
             INPUT_FILE="source/$FILENAME"
             OUTPUT_ARCHIVE="${OUTPUT_FOLDER}/${ARCHIVE_NAME}.7z"
-            
           else
-            echo "Archiving website: $SOURCE_DIR"
+            echo "Archiving website: $SOURCE_PATH"
             INPUT_FILE="source/$SOURCE_DIR"
-            # Get the last part of the path for the archive name
             ARCHIVE_NAME=$(basename "$INPUT_FILE")
             OUTPUT_ARCHIVE="${OUTPUT_FOLDER}/${ARCHIVE_NAME}.7z"
           fi
