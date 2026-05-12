@@ -44,7 +44,18 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y p7zip-full wget dnsutils
+          sudo apt-get install -y p7zip-full wget
+
+      - name: Fix DNS resolution
+        run: |
+          # Backup original resolv.conf
+          sudo cp /etc/resolv.conf /etc/resolv.conf.bak
+          # Use Google DNS
+          echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+          echo "nameserver 8.8.4.4" | sudo tee -a /etc/resolv.conf
+          echo "DNS changed to Google DNS."
+          # Test resolution
+          dig gameplex.ir +short || echo "DNS test failed, but proceeding..."
 
       - name: Clean old archives
         if: ${{ github.event.inputs.delete_old_archives == 'true' }}
@@ -88,9 +99,8 @@ jobs:
             FILENAME=$(echo "$FILENAME" | cut -d'?' -f1)
             if [ -z "$FILENAME" ]; then FILENAME="downloaded_file"; fi
             
-            # Use Google DNS for better resolution in restricted environments
-            echo "Downloading $FILENAME using Google DNS..."
-            if curl --resolve "$(echo $URL | cut -d'/' -f3):443:8.8.8.8" -L --fail --retry 5 --retry-delay 10 --connect-timeout 30 -o "source/$FILENAME" "$URL"; then
+            echo "Downloading $FILENAME..."
+            if curl -L --fail --retry 5 --retry-delay 10 --connect-timeout 30 -o "source/$FILENAME" "$URL"; then
               echo "status=success" >> $GITHUB_OUTPUT
               echo "filename=$FILENAME" >> $GITHUB_OUTPUT
             else
@@ -102,12 +112,12 @@ jobs:
             echo "Downloading website..."
             SITE_DOMAIN=$(echo "$URL" | sed 's|https\?://||' | sed 's|/.*||')
             
-            # Use wget with Google DNS
-            echo "Downloading site: $SITE_DOMAIN using Google DNS..."
+            echo "Downloading site: $SITE_DOMAIN..."
             
             # Clean source dir before download
             rm -rf source/*
             
+            # Use wget with Google DNS (since we changed /etc/resolv.conf)
             wget -r -k -p -e robots=off --no-check-certificate --timeout=30 \
               --directory-prefix=source \
               --convert-links \
@@ -177,8 +187,11 @@ jobs:
           echo "archive_name=${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
           echo "Archive created: $OUTPUT_ARCHIVE"
 
-      - name: Configure Git
+      - name: Restore DNS and Configure Git
         run: |
+          # Restore original resolv.conf
+          sudo cp /etc/resolv.conf.bak /etc/resolv.conf
+          
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
