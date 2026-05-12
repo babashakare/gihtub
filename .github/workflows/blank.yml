@@ -1,39 +1,14 @@
-name: انتقال فایل یا سایت به گیت هاب
+name: دانلود سایت یا فایل و آپلود به گیت هاب
 on:
   workflow_dispatch:
     inputs:
-      site_url:
-        description: '🌐 آدرس سایت برای دانلود کل (اختیاری - اگر پر شود، کل سایت دانلود می‌شود)'
-        required: false
-        type: string
-        default: ''
-      file_url_1:
-        description: 'لینک ۱ (الزامی در صورت عدم ورودی سایت)'
-        required: false
-        type: string
-        default: ''
-      file_url_2:
-        description: 'لینک ۲ (اختیاری)'
-        required: false
-        type: string
-        default: ''
-      file_url_3:
-        description: 'لینک ۳ (اختیاری)'
-        required: false
-        type: string
-        default: ''
-      file_url_4:
-        description: 'لینک ۴ (اختیاری)'
-        required: false
-        type: string
-        default: ''
-      file_url_5:
-        description: 'لینک ۵ (اختیاری)'
-        required: false
+      target_url:
+        description: '🔗 لینک سایت یا فایل برای دانلود'
+        required: true
         type: string
         default: ''
       zip_password:
-        description: '🔒 تعیین رمز برای فایل آرشیو'
+        description: '🔒 رمز فایل (اختیاری - خالی بگذارید اگر رمز نمی‌خواهید)'
         required: false
         type: string
         default: ''
@@ -44,11 +19,11 @@ on:
         type: choice
         default: '95'
         options:
-          - '25  (اینترنت ضعیف - فایل‌های کوچک)'
+          - '25  (اینترنت ضعیف)'
           - '50  (متوسط)'
-          - '95  (حداکثر - برای فایل‌های حجیم)'
+          - '95  (حداکثر)'
       delete_old_archives:
-        description: 'پاک کردن فایل‌های قبلی (در صورت تیک زدن، تمام آرشیوهای قدیمی حذف میشن)'
+        description: 'پاک کردن آرشیوهای قبلی؟'
         required: false
         type: boolean
         default: false
@@ -58,14 +33,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  leech-split-file:
+  download-and-upload:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
-      
+
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
@@ -74,181 +49,156 @@ jobs:
       - name: Clean old archives
         if: ${{ github.event.inputs.delete_old_archives == 'true' }}
         run: |
-          echo "Cleaning old archives..."
           find . -maxdepth 1 -type f \( -name "*.7z.*" -o -name "*.7z" \) -exec rm -v {} \;
-          find . -maxdepth 1 -type d \( -name "downloads" -o -name "site_download" \) -exec rm -rf {} \;
+          find . -maxdepth 1 -type d -name "downloads" -exec rm -rf {} \;
           git rm --cached *.7z* 2>/dev/null || true
           git rm --cached -r downloads 2>/dev/null || true
-          git rm --cached -r site_download 2>/dev/null || true
           echo "Old archives cleaned."
 
-      - name: Setup Environment
-        id: setup
+      - name: Setup variables
+        id: vars
         run: |
           SIZE=$(echo "${{ github.event.inputs.split_size }}" | grep -oP '\d+')
           echo "split_mb=${SIZE:-95}" >> $GITHUB_OUTPUT
           
-          # Check if site_url is provided
-          if [ -n "${{ github.event.inputs.site_url }}" ]; then
-            echo "mode=website" >> $GITHUB_OUTPUT
-            echo "site_url=${{ github.event.inputs.site_url }}" >> $GITHUB_OUTPUT
-            echo "Mode: Website Download"
+          URL="${{ github.event.inputs.target_url }}"
+          # Remove trailing slash if exists for consistency
+          URL="${URL%/}"
+          
+          # Determine if it's likely a website or a direct file
+          # If it ends with common file extensions, treat as file. Otherwise, treat as site.
+          if [[ "$URL" =~ \.(jpg|jpeg|png|gif|pdf|zip|rar|exe|mp4|mp3|iso|dmg|tar|gz|bz2)$ ]]; then
+            echo "type=file" >> $GITHUB_OUTPUT
+            echo "Is likely a direct file download."
           else
-            echo "mode=files" >> $GITHUB_OUTPUT
-            # Prepare URLs list
-            echo "${{ github.event.inputs.file_url_1 }}" > urls.txt
-            if [ -n "${{ github.event.inputs.file_url_2 }}" ]; then echo "${{ github.event.inputs.file_url_2 }}" >> urls.txt; fi
-            if [ -n "${{ github.event.inputs.file_url_3 }}" ]; then echo "${{ github.event.inputs.file_url_3 }}" >> urls.txt; fi
-            if [ -n "${{ github.event.inputs.file_url_4 }}" ]; then echo "${{ github.event.inputs.file_url_4 }}" >> urls.txt; fi
-            if [ -n "${{ github.event.inputs.file_url_5 }}" ]; then echo "${{ github.event.inputs.file_url_5 }}" >> urls.txt; fi
+            echo "type=website" >> $GITHUB_OUTPUT
+            echo "Is likely a website URL."
+          fi
+          echo "URL: $URL"
+          echo "Type: ${{ steps.vars.outputs.type }}"
+
+      - name: Download Content
+        id: download
+        run: |
+          URL="${{ github.event.inputs.target_url }}"
+          URL="${URL%/}"
+          
+          mkdir -p source
+          
+          if [ "${{ steps.vars.outputs.type }}" == "file" ]; then
+            echo "Downloading file..."
+            # Get filename from URL
+            FILENAME=$(basename "$URL")
+            if [ -z "$FILENAME" ]; then
+              FILENAME="downloaded_file"
+            fi
+            # Remove query params if any for naming
+            FILENAME=$(echo "$FILENAME" | cut -d'?' -f1)
             
-            # Remove empty lines
-            sed -i '/^$/d' urls.txt
-            sed -i 's/^[ \t]*//;s/[ \t]*$//' urls.txt
+            echo "Downloading $FILENAME"
+            if curl -L --fail --retry 5 --retry-delay 10 --connect-timeout 30 -o "source/$FILENAME" "$URL"; then
+              echo "status=success" >> $GITHUB_OUTPUT
+              echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+            else
+              echo "status=failed" >> $GITHUB_OUTPUT
+              echo "Failed to download file."
+              exit 1
+            fi
+          else
+            echo "Downloading website..."
+            # Use wget to mirror the website
+            # -r: recursive
+            # -k: convert links for local viewing
+            # -p: download all files needed for display
+            # -e robots=off: ignore robots.txt
+            # --no-check-certificate: skip SSL errors
+            # --timeout: connection timeout
+            # --directory-prefix: where to save files
+            # --convert-links: convert links in downloaded HTML to relative
+            # --adjust-extension: add .html if needed
+            # --page-requisites: download CSS, etc.
+            # -H: span across hosts
+            # --no-host-directories: don't create host directories
+            # -D: domains to accept (optional, but good for limiting)
             
-            total=$(wc -l < urls.txt)
-            echo "url_count=${total}" >> $GITHUB_OUTPUT
-            echo "Mode: File Downloads"
-            echo "URL count: ${total}"
-            cat urls.txt
+            SITE_NAME=$(echo "$URL" | sed 's|https\?://||' | sed 's|/.*||' | sed 's/\./_/g')
+            
+            wget -r -k -p -e robots=off --no-check-certificate --timeout=30 \
+              --directory-prefix=source \
+              --convert-links \
+              --adjust-extension \
+              --page-requisites \
+              --no-host-directories \
+              "$URL" || echo "Download finished with some warnings/errors, but proceeding..."
+            
+            # Clean up the top-level index.html if it was downloaded into a subfolder, 
+            # but usually wget creates a folder with the domain name or puts index.html in the prefix dir.
+            # Let's find the main folder created.
+            # Usually it creates a folder named like the domain in the directory-prefix.
+            # If it created 'source/example.com', we want to archive that.
+            # If it created 'source/index.html', we want to archive the current dir content.
+            
+            # Check if a folder was created
+            FOLDERS=$(find source -maxdepth 1 -type d -not -name "source")
+            if [ -n "$FOLDERS" ]; then
+              # If there's a folder, use it
+              echo "Found folder: $FOLDERS"
+              # Move contents up if needed or just archive the folder
+              # Let's archive the specific folder created by wget
+              echo "source_folder=$(echo $FOLDERS | head -n 1)" >> $GITHUB_OUTPUT
+              echo "status=success" >> $GITHUB_OUTPUT
+            else
+              # If no folder, wget put files in source/
+              echo "source_folder=source" >> $GITHUB_OUTPUT
+              echo "status=success" >> $GITHUB_OUTPUT
+            fi
           fi
 
-      - name: Download Website
-        if: ${{ steps.setup.outputs.mode == 'website' }}
-        id: download_website
+      - name: Archive and Split
+        id: archive
         run: |
-          SITE_URL="${{ steps.setup.outputs.site_url }}"
-          mkdir -p site_download
-          echo "Starting download of: $SITE_URL"
-          echo "This may take a while depending on the site size..."
-          
-          wget -r -k -p -e robots=off --no-check-certificate --timeout=30 \
-            --directory-prefix=site_download \
-            --convert-links \
-            --adjust-extension \
-            --page-requisites \
-            "$SITE_URL" || echo "Download finished with some errors, but proceeding..."
-          
-          echo "Website download completed."
-
-      - name: Download all files
-        if: ${{ steps.setup.outputs.mode == 'files' }}
-        id: download_files
-        run: |
-          mkdir -p files
-          total=${{ steps.setup.outputs.url_count }}
-          counter=1
-          success=0
-          while IFS= read -r url; do
-            echo "========================================="
-            echo "[$counter/$total] Downloading: $url"
-            FILENAME_FROM_URL=$(echo "$url" | sed 's/?.*//' | xargs basename)
-            if [ -z "$FILENAME_FROM_URL" ]; then
-              FILENAME_FROM_URL="unknown_${counter}"
-            fi
-            FILENAME_BASE="${FILENAME_FROM_URL%.*}"
-            FILENAME_EXT="${FILENAME_FROM_URL##*.}"
-            if [ "$FILENAME_BASE" = "$FILENAME_FROM_URL" ]; then
-              FILENAME_EXT=""
-            fi
-            PREFIX="sci-hub.ir"
-            if [ "$total" -gt 1 ]; then
-              NUM=$(printf '%02d' $counter)
-              DL_NAME="${PREFIX}_${NUM}_${FILENAME_BASE}"
-            else
-              DL_NAME="${PREFIX}_${FILENAME_BASE}"
-            fi
-            MAXLEN=50
-            if [ ${#DL_NAME} -gt $MAXLEN ]; then
-              if [ "$total" -gt 1 ]; then
-                KEEP=$((MAXLEN - ${#PREFIX} - 4))
-              else
-                KEEP=$((MAXLEN - ${#PREFIX} - 1))
-              fi
-              DL_NAME="${DL_NAME:0:$MAXLEN}"
-            fi
-            if [ -n "$FILENAME_EXT" ]; then
-              FINAL_FILENAME="${DL_NAME}.${FILENAME_EXT}"
-            else
-              FINAL_FILENAME="${DL_NAME}"
-            fi
-            echo "Download filename: ${FINAL_FILENAME}"
-            if curl -L --fail --retry 5 --retry-delay 10 --connect-timeout 30 -o "files/${FINAL_FILENAME}" "$url"; then
-              size=$(ls -lh "files/${FINAL_FILENAME}" | awk '{print $5}')
-              echo "Downloaded: ${FINAL_FILENAME} ($size)"
-              success=$((success + 1))
-            else
-              echo "Failed: $url"
-            fi
-            counter=$((counter + 1))
-          done < urls.txt
-          echo "success_count=${success}" >> $GITHUB_OUTPUT
-          echo "Downloaded: $success / $total"
-
-      - name: Process and archive
-        id: process_files
-        run: |
-          SPLIT_MB=${{ steps.setup.outputs.split_mb }}
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          FOLDER="downloads/${TIMESTAMP}"
-          mkdir -p "$FOLDER"
+          SPLIT_MB=${{ steps.vars.outputs.split_mb }}
           PASSWORD="${{ github.event.inputs.zip_password }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          OUTPUT_FOLDER="downloads/${TIMESTAMP}"
+          mkdir -p "$OUTPUT_FOLDER"
           
-          echo "Output folder: ${FOLDER}"
-          echo "Split size: ${SPLIT_MB}MB"
+          SOURCE_DIR="${{ steps.download.outputs.source_folder }}"
           
-          counter=0
-          
-          # Case 1: Website Download
-          if [ -d "site_download" ] && [ "$(ls -A site_download)" ]; then
-            counter=$((counter + 1))
-            echo "========================================="
-            echo "Processing Website Archive..."
+          if [ "${{ steps.vars.outputs.type }}" == "file" ]; then
+            FILENAME="${{ steps.download.outputs.filename }}"
+            ARCHIVE_NAME="${FILENAME%.????}"}" # Remove extension for archive name
+            ARCHIVE_NAME="${ARCHIVE_NAME%.???}"
+            ARCHIVE_NAME="${ARCHIVE_NAME%.??}"
+            ARCHIVE_NAME="${ARCHIVE_NAME%.?}"
+            ARCHIVE_NAME="${ARCHIVE_NAME:-archived_file}"
             
-            if [ "${#PASSWORD}" -gt 0 ]; then
-              7z a -p"$PASSWORD" -mhe=on -mx=3 -v${SPLIT_MB}m "${FOLDER}/website_site_download.7z" "site_download"
-            else
-              7z a -mx=3 -v${SPLIT_MB}m "${FOLDER}/website_site_download.7z" "site_download"
-            fi
+            echo "Archiving file: $FILENAME"
+            INPUT_FILE="source/$FILENAME"
+            OUTPUT_ARCHIVE="${OUTPUT_FOLDER}/${ARCHIVE_NAME}.7z"
             
-            if [ -f "${FOLDER}/website_site_download.7z.001" ] && [ ! -f "${FOLDER}/website_site_download.7z.002" ]; then
-              mv "${FOLDER}/website_site_download.7z.001" "${FOLDER}/website_site_download.7z"
-              echo "Single chunk for website"
-            else
-              echo "Multiple chunks for website"
-            fi
-            echo "Processed website."
+          else
+            echo "Archiving website: $SOURCE_DIR"
+            INPUT_FILE="source/$SOURCE_DIR"
+            # Get the last part of the path for the archive name
+            ARCHIVE_NAME=$(basename "$INPUT_FILE")
+            OUTPUT_ARCHIVE="${OUTPUT_FOLDER}/${ARCHIVE_NAME}.7z"
           fi
 
-          # Case 2: File Downloads
-          if [ -d "files" ] && [ "$(ls -A files)" ]; then
-            for file in files/*; do
-              [ -f "$file" ] || continue
-              counter=$((counter + 1))
-              echo "========================================="
-              echo "Processing: $(basename "$file")"
-              FILENAME=$(basename "$file")
-              
-              if [ "${#PASSWORD}" -gt 0 ]; then
-                7z a -p"$PASSWORD" -mhe=on -mx=3 -v${SPLIT_MB}m "${FOLDER}/${FILENAME}.7z" "$file"
-              else
-                7z a -mx=3 -v${SPLIT_MB}m "${FOLDER}/${FILENAME}.7z" "$file"
-              fi
-              
-              if [ -f "${FOLDER}/${FILENAME}.7z.001" ] && [ ! -f "${FOLDER}/${FILENAME}.7z.002" ]; then
-                mv "${FOLDER}/${FILENAME}.7z.001" "${FOLDER}/${FILENAME}.7z"
-                echo "Single chunk"
-              else
-                echo "Multiple chunks"
-              fi
-            done
-            rm -rf files
-            echo "Processed files."
+          if [ "${#PASSWORD}" -gt 0 ]; then
+            echo "Archiving with password..."
+            7z a -p"$PASSWORD" -mhe=on -mx=3 -v${SPLIT_MB}m "$OUTPUT_ARCHIVE" "$INPUT_FILE"
+          else
+            echo "Archiving without password..."
+            7z a -mx=3 -v${SPLIT_MB}m "$OUTPUT_ARCHIVE" "$INPUT_FILE"
           fi
           
-          rm -rf site_download
-          echo "processed_count=${counter}" >> $GITHUB_OUTPUT
-          echo "folder=${FOLDER}" >> $GITHUB_OUTPUT
+          # Clean up source
+          rm -rf source
+          
+          echo "folder=${OUTPUT_FOLDER}" >> $GITHUB_OUTPUT
+          echo "archive_name=${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
+          echo "Archive created: $OUTPUT_ARCHIVE"
 
       - name: Configure Git
         run: |
@@ -256,19 +206,21 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
 
-      - name: Commit and Push all chunks
+      - name: Commit and Push
         run: |
-          FOLDER="${{ steps.process_files.outputs.folder }}"
+          FOLDER="${{ steps.archive.outputs.folder }}"
           echo "Adding files from ${FOLDER}..."
           git add "${FOLDER}/"*.7z* 2>/dev/null || true
+          
           if ! git diff --staged --quiet; then
             file_count=$(git diff --staged --name-only | wc -l)
-            git commit -m "Add ${{ steps.process_files.outputs.processed_count }} archive(s) in ${FOLDER} (${file_count} chunks)"
+            git commit -m "Add archive: ${{ steps.archive.outputs.archive_name }} (${file_count} chunks)"
             echo "Committed $file_count files."
+            
             push_success=false
             max_attempts=15
             for attempt in $(seq 1 $max_attempts); do
-              echo "Push attempt $attempt of $max_attempts..."
+              echo "Push attempt $attempt..."
               git pull --rebase origin main 2>/dev/null || true
               if git push origin main; then
                 echo "Push successful on attempt $attempt."
@@ -279,6 +231,7 @@ jobs:
                 sleep 20
               fi
             done
+            
             if [ "$push_success" = false ]; then
               echo "Push failed after $max_attempts attempts."
               exit 1
@@ -289,33 +242,29 @@ jobs:
 
       - name: Summary
         run: |
-          FOLDER="${{ steps.process_files.outputs.folder }}"
+          FOLDER="${{ steps.archive.outputs.folder }}"
           TOTAL_SIZE=$(du -sh "$FOLDER" 2>/dev/null | awk '{print $1}')
           if [ -z "$TOTAL_SIZE" ]; then TOTAL_SIZE="N/A"; fi
           
           echo ""
           echo "========================================="
           echo "Job completed!"
-          if [ "${{ steps.setup.outputs.mode }}" == "website" ]; then
-            echo "Type: Website Download"
-            echo "URL: ${{ steps.setup.outputs.site_url }}"
-          else
-            echo "Downloaded: ${{ steps.download_files.outputs.success_count }} / ${{ steps.setup.outputs.url_count }}"
-          fi
-          echo "Processed: ${{ steps.process_files.outputs.processed_count }} archive(s)"
-          echo "Split size: ${{ steps.setup.outputs.split_mb }}MB"
+          echo "Archive Name: ${{ steps.archive.outputs.archive_name }}"
+          echo "Split size: ${{ steps.vars.outputs.split_mb }}MB"
           echo "Folder: $FOLDER"
           echo "Total size: ${TOTAL_SIZE}"
           echo "========================================="
+          
           cat >> $GITHUB_STEP_SUMMARY << EOF
           <div dir="rtl">
           ## 📊 خلاصه اجرا
           | مورد | مقدار |
           |------|-------|
-          | نوع دانلود | ${{ steps.setup.outputs.mode == 'website' && 'سایت وب' || 'فایل‌های جداگانه' }} |
-          | لینک/آدرس | ${{ steps.setup.outputs.mode == 'website' && steps.setup.outputs.site_url || steps.setup.outputs.url_count + ' فایل' }} |
-          | فایل پردازش شده | ${{ steps.process_files.outputs.processed_count }} عدد آرشیو |
-          | حداکثر حجم هر تکه | ${{ steps.setup.outputs.split_mb }} مگابایت |
+          | لینک ورودی | ${{ github.event.inputs.target_url }} |
+          | نوع دانلود | ${{ steps.vars.outputs.type == 'website' && 'سایت وب' || 'فایل' }} |
+          | نام آرشیو | ${{ steps.archive.outputs.archive_name }} |
+          | رمزگذاری | ${{ github.event.inputs.zip_password != '' && 'دارد' || 'ندارد' }} |
+          | حداکثر حجم هر تکه | ${{ steps.vars.outputs.split_mb }} مگابایت |
           | حجم کل | ${TOTAL_SIZE} |
           | 📂 پوشه دانلود | [ ${FOLDER}](https://github.com/${{ github.repository }}/tree/main/${FOLDER}) |
           | وضعیت | ✅ موفق |
