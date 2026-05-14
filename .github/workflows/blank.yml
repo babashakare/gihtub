@@ -1,4 +1,5 @@
-name: دانلود سایت یا فایل و آپلود به گیت هاب
+name: دانلود سایت و آپلود به گیت هاب
+
 on:
   workflow_dispatch:
     inputs:
@@ -6,12 +7,12 @@ on:
         description: '🔗 لینک سایت یا فایل برای دانلود'
         required: true
         type: string
-        default: ''
+        default: 'https://gameplex-final.vercel.app/gameplex-v1/'
       zip_password:
         description: '🔒 رمز فایل (اختیاری - خالی بگذارید اگر رمز نمی‌خواهید)'
         required: false
         type: string
-        default: ''
+        default: '13671367'
       split_size:
         description: |
           حداکثر حجم هر تکه (مگابایت)
@@ -27,11 +28,14 @@ on:
         required: false
         type: boolean
         default: false
+
 permissions:
   contents: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
+
 jobs:
   download-and-upload:
     runs-on: ubuntu-latest
@@ -44,25 +48,23 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y p7zip-full wget
+          sudo apt-get install -y p7zip-full wget curl dnsutils
 
       - name: Fix DNS resolution
         run: |
           # Backup original resolv.conf
           sudo cp /etc/resolv.conf /etc/resolv.conf.bak
-          # Use Google DNS
+          # Use Google DNS for better stability
           echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
           echo "nameserver 8.8.4.4" | sudo tee -a /etc/resolv.conf
           echo "DNS changed to Google DNS."
-          # Test resolution
-          dig gameplex.ir +short || echo "DNS test failed, but proceeding..."
 
       - name: Clean old archives
         if: ${{ github.event.inputs.delete_old_archives == 'true' }}
         run: |
           find . -maxdepth 1 -type f \( -name "*.7z.*" -o -name "*.7z" \) -exec rm -v {} \;
           find . -maxdepth 1 -type d -name "downloads" -exec rm -rf {} \;
-          git rm --cached *.7z* 2>/dev/null || true
+          git rm --cached _.7z_ 2>/dev/null || true
           git rm --cached -r downloads 2>/dev/null || true
           echo "Old archives cleaned."
 
@@ -71,11 +73,9 @@ jobs:
         run: |
           SIZE=$(echo "${{ github.event.inputs.split_size }}" | grep -oP '\d+')
           echo "split_mb=${SIZE:-95}" >> $GITHUB_OUTPUT
-          
           URL="${{ github.event.inputs.target_url }}"
           # Remove trailing slash
           URL="${URL%/}"
-          
           # Determine type
           if [[ "$URL" =~ \.(jpg|jpeg|png|gif|pdf|zip|rar|exe|mp4|mp3|iso|dmg|tar|gz|bz2)$ ]]; then
             echo "type=file" >> $GITHUB_OUTPUT
@@ -90,7 +90,6 @@ jobs:
         run: |
           URL="${{ github.event.inputs.target_url }}"
           URL="${URL%/}"
-          
           mkdir -p source
           
           if [ "${{ steps.vars.outputs.type }}" == "file" ]; then
@@ -98,7 +97,6 @@ jobs:
             FILENAME=$(basename "$URL")
             FILENAME=$(echo "$FILENAME" | cut -d'?' -f1)
             if [ -z "$FILENAME" ]; then FILENAME="downloaded_file"; fi
-            
             echo "Downloading $FILENAME..."
             if curl -L --fail --retry 5 --retry-delay 10 --connect-timeout 30 -o "source/$FILENAME" "$URL"; then
               echo "status=success" >> $GITHUB_OUTPUT
@@ -111,18 +109,22 @@ jobs:
           else
             echo "Downloading website..."
             SITE_DOMAIN=$(echo "$URL" | sed 's|https\?://||' | sed 's|/.*||')
-            
             echo "Downloading site: $SITE_DOMAIN..."
             
             # Clean source dir before download
             rm -rf source/*
             
-            # Use wget with Google DNS (since we changed /etc/resolv.conf)
+            # Use wget to download the site
+            # -r: recursive
+            # -k: convert links
+            # -p: page requisites (CSS, JS, images)
+            # -e robots=off: ignore robots.txt
+            # --no-check-certificate: allow self-signed or invalid certs if any
+            # --user-agent: mimic a browser
             wget -r -k -p -e robots=off --no-check-certificate --timeout=30 \
               --directory-prefix=source \
               --convert-links \
               --adjust-extension \
-              --page-requisites \
               --no-host-directories \
               --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" \
               "$URL" 2>&1 | tee wget_log.txt || echo "Download finished with some warnings/errors."
@@ -171,9 +173,13 @@ jobs:
             ARCHIVE_NAME=$(basename "$INPUT_FILE")
             OUTPUT_ARCHIVE="${OUTPUT_FOLDER}/${ARCHIVE_NAME}.7z"
           fi
-
+          
           if [ "${#PASSWORD}" -gt 0 ]; then
             echo "Archiving with password..."
+            # -p: password
+            # -mhe=on: encrypt headers (metadata) as well
+            # -mx=3: medium compression speed
+            # -v${SPLIT_MB}m: split volume size
             7z a -p"$PASSWORD" -mhe=on -mx=3 -v${SPLIT_MB}m "$OUTPUT_ARCHIVE" "$INPUT_FILE"
           else
             echo "Archiving without password..."
@@ -191,7 +197,6 @@ jobs:
         run: |
           # Restore original resolv.conf
           sudo cp /etc/resolv.conf.bak /etc/resolv.conf
-          
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
